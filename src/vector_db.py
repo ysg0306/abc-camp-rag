@@ -99,18 +99,39 @@ class SimpleTfidfEmbeddingFunction(EmbeddingFunction):
 _global_embedding_fn = None
 
 
-def get_embedding_function_instance(csv_path: str) -> SimpleTfidfEmbeddingFunction:
-    """CSV 데이터를 바탕으로 전역 SimpleTfidfEmbeddingFunction 싱글톤 인스턴스를 획득합니다."""
+def get_embedding_function_instance(csv_path: str = None, df: pd.DataFrame = None) -> SimpleTfidfEmbeddingFunction:
+    """CSV 파일 경로 또는 DataFrame 데이터를 바탕으로 전역 SimpleTfidfEmbeddingFunction 싱글톤 인스턴스를 획득합니다.
+
+    Args:
+        csv_path: 수집된 도서 CSV 파일 경로.
+        df: 전처리 완료된 도서 DataFrame. 만약 df가 전달되면 csv_path보다 우선하여 사용됩니다.
+
+    Returns:
+        SimpleTfidfEmbeddingFunction 임베딩 함수 인스턴스. 데이터가 없으면 None을 반환합니다.
+    """
     global _global_embedding_fn
+    # 업로드되는 데이터가 매번 다를 수 있으므로, df가 제공되는 경우에는 매번 새로운 인스턴스를 빌드하고,
+    # csv_path 기반 기본 모드일 때만 _global_embedding_fn 싱글톤 캐시를 활용하도록 설계합니다.
+    if df is not None:
+        corpus_texts = []
+        for idx, row in df.iterrows():
+            title = str(row.get("도서명", "")).strip()
+            author = str(row.get("저자", "")).strip()
+            publisher = str(row.get("출판사", "")).strip()
+            intro = str(row.get("책소개", "")).strip() if not pd.isna(row.get("책소개")) else ""
+            document_text = f"도서명: {title}\n저자: {author}\n출판사: {publisher}\n책소개: {intro}"
+            corpus_texts.append(document_text)
+        return SimpleTfidfEmbeddingFunction(corpus_texts, vocab_size_limit=1000)
+
     if _global_embedding_fn is not None:
         return _global_embedding_fn
 
-    if not os.path.exists(csv_path):
+    if csv_path is None or not os.path.exists(csv_path):
         return None
 
-    df = pd.read_csv(csv_path)
+    df_local = pd.read_csv(csv_path)
     corpus_texts = []
-    for idx, row in df.iterrows():
+    for idx, row in df_local.iterrows():
         title = str(row.get("도서명", "")).strip()
         author = str(row.get("저자", "")).strip()
         publisher = str(row.get("출판사", "")).strip()
@@ -118,21 +139,22 @@ def get_embedding_function_instance(csv_path: str) -> SimpleTfidfEmbeddingFuncti
         document_text = f"도서명: {title}\n저자: {author}\n출판사: {publisher}\n책소개: {intro}"
         corpus_texts.append(document_text)
 
-    # 1000차원 크기의 TF-IDF 임베딩 함수 인스턴스 빌드
     _global_embedding_fn = SimpleTfidfEmbeddingFunction(corpus_texts, vocab_size_limit=1000)
     return _global_embedding_fn
 
 
 def build_vector_db(
     csv_path: str = "data/yes24_bestsellers.csv",
+    df: pd.DataFrame = None,
     db_path: str = "data/chroma_db",
     collection_name: str = "yes24_bestsellers",
     force_rebuild: bool = False,
 ) -> bool:
-    """ChromaDB를 연동하여 CSV 데이터를 임베딩 함수와 함께 실제 로컬 DB 파일로 인덱싱해 저장합니다.
+    """ChromaDB를 연동하여 CSV 데이터 또는 DataFrame을 임베딩 함수와 함께 실제 로컬 DB 파일로 인덱싱해 저장합니다.
 
     Args:
         csv_path: 수집된 도서 CSV 파일 경로.
+        df: 직접 전달된 도서 메타데이터 DataFrame. csv_path가 없거나 df가 유효하면 이를 우선 사용합니다.
         db_path: 로컬 벡터 DB 디렉토리 경로.
         collection_name: 사용할 크로마 컬렉션 명칭.
         force_rebuild: True 설정 시 기존 컬렉션을 삭제하고 강제 재구축합니다.
@@ -140,17 +162,20 @@ def build_vector_db(
     Returns:
         성공적으로 파일 인덱스가 저장 완료되면 True를 반환합니다.
     """
-    if not os.path.exists(csv_path):
-        print(f"오류: '{csv_path}' 파일이 존재하지 않아 인덱스를 빌드할 수 없습니다.")
+    if df is not None:
+        target_df = df
+    elif csv_path and os.path.exists(csv_path):
+        target_df = pd.read_csv(csv_path)
+    else:
+        print(f"오류: 유효한 DataFrame이 없거나 존재하지 않는 csv_path('{csv_path}')입니다.")
         return False
 
-    df = pd.read_csv(csv_path)
-    if df.empty:
+    if target_df.empty:
         print("경고: CSV 도서 데이터가 비어 있습니다.")
         return False
 
     # 1단계: 커스텀 TF-IDF 임베딩 함수 인스턴스 준비
-    embedding_fn = get_embedding_function_instance(csv_path)
+    embedding_fn = get_embedding_function_instance(csv_path=csv_path, df=target_df)
     if embedding_fn is None:
         return False
 
@@ -175,18 +200,18 @@ def build_vector_db(
 
     # 이미 동일 개수의 데이터 파일이 생성되어 있는지 체크
     if not force_rebuild and collection.count() > 0:
-        if abs(collection.count() - len(df)) <= 5:
+        if abs(collection.count() - len(target_df)) <= 5:
             print(f"이미 ChromaDB 벡터 데이터베이스 파일이 성공적으로 생성되어 있습니다. (데이터 수: {collection.count()}개)")
             return True
 
-    print(f"ChromaDB 벡터 데이터베이스 파일 생성을 시작합니다... (대상: {len(df)}권)")
+    print(f"ChromaDB 벡터 데이터베이스 파일 생성을 시작합니다... (대상: {len(target_df)}권)")
 
     ids = []
     documents = []
     metadatas = []
 
-    for idx, row in df.iterrows():
-        doc_id = str(row.get("상세링크")) if not pd.isna(row.get("상세링크")) else f"book_idx_{idx}"
+    for idx, row in target_df.iterrows():
+        doc_id = str(row.get("상세링크")) if not pd.isna(row.get("상세링크")) and str(row.get("상세링크")).strip() != "" else f"book_idx_{idx}"
         title = str(row.get("도서명", "")).strip()
         author = str(row.get("저자", "")).strip()
         publisher = str(row.get("출판사", "")).strip()
@@ -251,6 +276,8 @@ def build_vector_db(
 
 def query_books(
     query: str,
+    csv_path: str = "data/yes24_bestsellers.csv",
+    df: pd.DataFrame = None,
     db_path: str = "data/chroma_db",
     collection_name: str = "yes24_bestsellers",
     n_results: int = 15,
@@ -259,6 +286,8 @@ def query_books(
 
     Args:
         query: 사용자 자연어 검색 질의.
+        csv_path: 도서 CSV 파일 경로.
+        df: 직접 전달된 도서 메타데이터 DataFrame. csv_path 대신 우선 사용 가능합니다.
         db_path: 로컬 DB 디렉토리 경로.
         collection_name: 사용할 컬렉션 명칭.
         n_results: 반환 결과 수.
@@ -267,7 +296,7 @@ def query_books(
         RAG 프롬프트 컨텍스트에 바로 공급할 수 있도록 요약 정렬된 도서 정보 마크다운 문자열.
     """
     try:
-        embedding_fn = get_embedding_function_instance("data/yes24_bestsellers.csv")
+        embedding_fn = get_embedding_function_instance(csv_path=csv_path, df=df)
         if embedding_fn is None:
             return "임베딩 사전 초기화에 실패했습니다."
 

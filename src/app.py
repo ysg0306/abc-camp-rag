@@ -1,10 +1,12 @@
 """Yes24 베스트셀러 탐색적 데이터 분석(EDA) 및 검색 Streamlit 대시보드.
 
-이 모듈은 data/yes24_bestsellers.csv 데이터를 읽어
+이 모듈은 data/yes24_bestsellers.csv 데이터를 읽거나 사용자가 업로드한 CSV를 활용하여
 가격 분포, 출판사 점유율, 판매지수 상관관계 등의 EDA 시각화를 제공하고,
 제목 및 책소개 텍스트 통합 키워드 검색 기능을 지원합니다.
 """
 
+import sys
+import os
 import re
 from collections import Counter
 import pandas as pd
@@ -14,88 +16,65 @@ import plotly.graph_objects as go
 import numpy as np
 from groq import Groq
 
-# 1. 페이지 기본 설정 및 디자인 테마
-st.set_page_config(
-    page_title="Yes24 IT/모바일 베스트셀러 대시보드",
-    page_icon="📚",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
+# 프로젝트 루트 경로를 sys.path에 추가하여 src 패키지 임포트 문제 해결
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Premium UI를 위한 커스텀 CSS 적용
-st.markdown("""
-<style>
-    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Noto+Sans+KR:wght@300;400;700&display=swap');
 
-    html, body, [class*="css"] {
-        font-family: 'Outfit', 'Noto Sans KR', sans-serif;
-    }
-    .main-title {
-        font-size: 2.8rem;
-        font-weight: 800;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.5rem;
-    }
-    .sub-title {
-        font-size: 1.1rem;
-        color: #718096;
-        margin-bottom: 2rem;
-    }
-    .metric-card {
-        background-color: #f7fafc;
-        border: 1px solid #e2e8f0;
-        border-radius: 12px;
-        padding: 1.25rem;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
-        transition: transform 0.2s;
-    }
-    .metric-card:hover {
-        transform: translateY(-2px);
-    }
-    .book-card {
-        background-color: #ffffff;
-        border: 1px solid #edf2f7;
-        border-radius: 16px;
-        padding: 1.5rem;
-        box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);
-        margin-bottom: 1.5rem;
-        border-left: 5px solid #667eea;
-    }
-    .book-title {
-        font-size: 1.3rem;
-        font-weight: 700;
-        color: #1a202c;
-        margin-bottom: 0.5rem;
-    }
-    .book-meta {
-        font-size: 0.9rem;
-        color: #4a5568;
-        margin-bottom: 1rem;
-    }
-    .badge {
-        background-color: #ebf8ff;
-        color: #2b6cb0;
-        padding: 0.25rem 0.6rem;
-        border-radius: 9999px;
-        font-size: 0.8rem;
-        font-weight: 600;
-        margin-right: 0.5rem;
-    }
-    .highlight {
-        background-color: #fefcbf;
-        padding: 0.1rem 0.3rem;
-        border-radius: 4px;
-        font-weight: 600;
-    }
-</style>
-""", unsafe_allow_html=True)
+def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
+    """도서 raw DataFrame 데이터를 로드하고 타입 변환 및 가공 처리를 적용합니다.
+
+    Args:
+        df: 원본 도서 데이터프레임.
+
+    Returns:
+        전처리가 완료된 데이터프레임.
+    """
+    df_clean = df.copy()
+
+    # 가격 데이터에서 쉼표 제거 및 숫자 변환
+    for col in ["판매가", "정가"]:
+        if col in df_clean.columns:
+            df_clean[col] = df_clean[col].astype(str).str.replace(",", "", regex=True)
+            df_clean[col] = pd.to_numeric(df_clean[col], errors="coerce")
+
+    # 판매지수 변환
+    if "판매지수" in df_clean.columns:
+        df_clean["판매지수"] = df_clean["판매지수"].astype(str).str.replace(",", "", regex=True)
+        df_clean["판매지수"] = pd.to_numeric(df_clean["판매지수"], errors="coerce")
+
+    # 평점 및 리뷰 수 변환
+    if "평점" in df_clean.columns:
+        df_clean["평점"] = pd.to_numeric(df_clean["평점"], errors="coerce")
+    if "리뷰수" in df_clean.columns:
+        df_clean["리뷰수"] = pd.to_numeric(df_clean["리뷰수"], errors="coerce")
+
+    # 할인율 계산 (정가 대비 판매가)
+    if "정가" in df_clean.columns and "판매가" in df_clean.columns:
+        df_clean["할인율"] = ((df_clean["정가"] - df_clean["판매가"]) / df_clean["정가"] * 100).round(1)
+        df_clean.loc[df_clean["할인율"] < 0, "할인율"] = 0
+        df_clean.loc[df_clean["할인율"] > 100, "할인율"] = 0
+
+    # 출판일로부터 연도 및 월 추출
+    if "출판일" in df_clean.columns:
+        df_clean["출판연도"] = df_clean["출판일"].astype(str).apply(
+            lambda x: re.search(r"(\d{4})년", x).group(1) if re.search(r"(\d{4})년", x) else "기타"
+        )
+        df_clean["출판월"] = df_clean["출판일"].astype(str).apply(
+            lambda x: re.search(r"(\d{1,2})월", x).group(1) if re.search(r"(\d{1,2})월", x) else "기타"
+        )
+
+    # 책소개 결측치 공백 처리
+    if "책소개" in df_clean.columns:
+        df_clean["책소개"] = df_clean["책소개"].fillna("")
+    else:
+        df_clean["책소개"] = ""
+
+    return df_clean
 
 
 @st.cache_data
 def load_and_preprocess_data() -> pd.DataFrame:
-    """Yes24 베스트셀러 CSV 데이터를 로드하고 데이터 타입을 변환하여 전처리합니다.
+    """로컬 Yes24 베스트셀러 CSV 데이터를 로드하고 전처리하여 반환합니다.
 
     Returns:
         전처리가 완료된 pandas DataFrame.
@@ -103,46 +82,27 @@ def load_and_preprocess_data() -> pd.DataFrame:
     try:
         df = pd.read_csv("data/yes24_bestsellers.csv")
     except FileNotFoundError:
-        st.error("데이터 파일('data/yes24_bestsellers.csv')을 찾을 수 없습니다. 크롤러를 실행해 데이터를 먼저 수집해 주세요.")
         return pd.DataFrame()
 
-    # 가격 데이터에서 쉼표 제거 및 숫자 변환
-    for col in ["판매가", "정가"]:
-        if col in df.columns:
-            df[col] = df[col].astype(str).str.replace(",", "", regex=True)
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return preprocess_data(df)
 
-    # 판매지수 변환
-    if "판매지수" in df.columns:
-        df["판매지수"] = df["판매지수"].astype(str).str.replace(",", "", regex=True)
-        df["판매지수"] = pd.to_numeric(df["판매지수"], errors="coerce")
 
-    # 평점 및 리뷰 수 변환
-    df["평점"] = pd.to_numeric(df["평점"], errors="coerce")
-    df["리뷰수"] = pd.to_numeric(df["리뷰수"], errors="coerce")
+@st.cache_data
+def load_uploaded_data(uploaded_file) -> pd.DataFrame:
+    """업로드된 CSV 파일을 읽어서 전처리 후 반환합니다.
 
-    # 할인율 계산 (정가 대비 판매가)
-    if "정가" in df.columns and "판매가" in df.columns:
-        df["할인율"] = ((df["정가"] - df["판매가"]) / df["정가"] * 100).round(1)
-        df.loc[df["할인율"] < 0, "할인율"] = 0
-        df.loc[df["할인율"] > 100, "할인율"] = 0
+    Args:
+        uploaded_file: Streamlit file_uploader 객체.
 
-    # 출판일로부터 연도 및 월 추출
-    if "출판일" in df.columns:
-        df["출판연도"] = df["출판일"].astype(str).apply(
-            lambda x: re.search(r"(\d{4})년", x).group(1) if re.search(r"(\d{4})년", x) else "기타"
-        )
-        df["출판월"] = df["출판일"].astype(str).apply(
-            lambda x: re.search(r"(\d{1,2})월", x).group(1) if re.search(r"(\d{1,2})월", x) else "기타"
-        )
-
-    # 책소개 결측치 공백 처리
-    if "책소개" in df.columns:
-        df["책소개"] = df["책소개"].fillna("")
-    else:
-        df["책소개"] = ""
-
-    return df
+    Returns:
+        전처리가 완료된 pandas DataFrame.
+    """
+    try:
+        df = pd.read_csv(uploaded_file)
+        return preprocess_data(df)
+    except Exception as e:
+        st.sidebar.error(f"업로드 데이터 파싱 에러: {e}")
+        return pd.DataFrame()
 
 
 def extract_keywords(texts: pd.Series, top_n: int = 20) -> list:
@@ -242,8 +202,10 @@ def prepare_book_context(df: pd.DataFrame, query: str = "") -> str:
     # 1. ChromaDB 벡터 검색 시도
     try:
         from src.vector_db import query_books
-        context = query_books(query=query, n_results=15)
-        if context and not context.startswith("도서 검색 처리 중 오류"):
+        is_uploaded = st.session_state.get("is_uploaded", False)
+        db_path = "data/uploaded_chroma_db" if is_uploaded else "data/chroma_db"
+        context = query_books(query=query, df=df, db_path=db_path, n_results=15)
+        if context and not context.startswith("도서 검색 처리 중 오류") and not context.startswith("ChromaDB 쿼리 수행 중"):
             return context
     except Exception as e:
         # 벡터 검색 중 오류 시 경고 사이드바 출력 후 기존 키워드 매칭 폴백
@@ -360,14 +322,110 @@ def get_groq_recommendation(
     return chat_completion.choices[0].message.content
 
 
-# 데이터 로드
-df = load_and_preprocess_data()
+# 1. 페이지 기본 설정 및 디자인 테마
+st.set_page_config(
+    page_title="Yes24 IT/모바일 베스트셀러 대시보드",
+    page_icon="📚",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# 데이터 로드 실패 시 중단
+# Premium UI를 위한 커스텀 CSS 적용
+st.markdown("""
+<style>
+    @import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Noto+Sans+KR:wght@300;400;700&display=swap');
+
+    html, body, [class*="css"] {
+        font-family: 'Outfit', 'Noto Sans KR', sans-serif;
+    }
+    .main-title {
+        font-size: 2.8rem;
+        font-weight: 800;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        margin-bottom: 0.5rem;
+    }
+    .sub-title {
+        font-size: 1.1rem;
+        color: #718096;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        background-color: #f7fafc;
+        border: 1px solid #e2e8f0;
+        border-radius: 12px;
+        padding: 1.25rem;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+        transition: transform 0.2s;
+    }
+    .metric-card:hover {
+        transform: translateY(-2px);
+    }
+    .book-card {
+        background-color: #ffffff;
+        border: 1px solid #edf2f7;
+        border-radius: 16px;
+        padding: 1.5rem;
+        box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.05);
+        margin-bottom: 1.5rem;
+        border-left: 5px solid #667eea;
+    }
+    .book-title {
+        font-size: 1.3rem;
+        font-weight: 700;
+        color: #1a202c;
+        margin-bottom: 0.5rem;
+    }
+    .book-meta {
+        font-size: 0.9rem;
+        color: #4a5568;
+        margin-bottom: 1rem;
+    }
+    .badge {
+        background-color: #ebf8ff;
+        color: #2b6cb0;
+        padding: 0.25rem 0.6rem;
+        border-radius: 9999px;
+        font-size: 0.8rem;
+        font-weight: 600;
+        margin-right: 0.5rem;
+    }
+    .highlight {
+        background-color: #fefcbf;
+        padding: 0.1rem 0.3rem;
+        border-radius: 4px;
+        font-weight: 600;
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# 2. 사이드바 파일 업로더 구성
+st.sidebar.markdown("### 📂 데이터 업로드")
+uploaded_file = st.sidebar.file_uploader(
+    "도서 정보 CSV 파일을 업로드하세요 (도서명, 저자, 출판사, 책소개 등 포함)",
+    type=["csv"]
+)
+
+# 데이터 로드 분기
+if uploaded_file is not None:
+    df = load_uploaded_data(uploaded_file)
+    is_uploaded = True
+else:
+    df = load_and_preprocess_data()
+    is_uploaded = False
+
+# 업로드 상태 세션 저장
+st.session_state["is_uploaded"] = is_uploaded
+
+# 데이터 로드 실패 시 유도 안내 및 중단
 if df.empty:
+    st.warning("📊 분석 및 챗봇에 사용할 도서 데이터가 로드되지 않았습니다.")
+    st.info("왼쪽 사이드바에서 도서 CSV 파일을 업로드하거나, 프로젝트 내 'data/yes24_bestsellers.csv' 파일 위치를 확인해 주세요.")
     st.stop()
 
-# 2. 사이드바 구성
+# 3. 사이드바 네비게이션 구성
+st.sidebar.markdown("---")
 st.sidebar.markdown("### 📊 네비게이션")
 menu = st.sidebar.radio("원하는 페이지를 선택하세요:", ["💡 데이터 분석 (EDA)", "🔍 키워드 통합 검색", "🤖 도서 추천 챗봇"])
 
@@ -717,10 +775,13 @@ elif menu == "🤖 도서 추천 챗봇":
     st.write("대시보드에 수집된 베스트셀러 도서 데이터를 기반으로 질문에 부합하는 도서를 추천해 드립니다.")
 
     # ChromaDB 벡터 DB 초기화 및 빌드 체크
-    with st.spinner("📚 한국어 도서 임베딩 모델(klue-bert) 및 벡터 DB를 초기화하고 있습니다. 최초 실행 시 다소 시간이 걸릴 수 있습니다..."):
+    with st.spinner("📚 한국어 도서 임베딩 모델(TF-IDF) 및 벡터 DB를 초기화하고 있습니다. 최초 실행 시 다소 시간이 걸릴 수 있습니다..."):
         try:
             from src.vector_db import build_vector_db
-            build_vector_db(csv_path="data/yes24_bestsellers.csv", db_path="data/chroma_db", force_rebuild=False)
+            if st.session_state.get("is_uploaded", False):
+                build_vector_db(df=df, db_path="data/uploaded_chroma_db", force_rebuild=False)
+            else:
+                build_vector_db(csv_path="data/yes24_bestsellers.csv", db_path="data/chroma_db", force_rebuild=False)
         except Exception as e:
             st.error(f"벡터 데이터베이스 초기화 중 오류가 발생했습니다: {e}")
 
